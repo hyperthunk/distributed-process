@@ -25,6 +25,10 @@ The short answers:
 - GHC 9.6 added thread introspection (`GHC.Conc.listThreads`, `threadLabel`),
   which gives us quiescence detection. That replaces the `threadDelay` calls
   the current suite relies on, and it needs no architectural change at all.
+- `distributed-process-client-server` is a separate problem, and `supervisor`,
+  `execution`, and `fsm` all inherit it. Its external STM inputs bypass both the
+  transport and the node controller, and its timers are RTS timers with no hook.
+  See section 10, which qualifies sections 4 to 9.
 
 The recommendation is a layered plan where each layer is independently useful
 and the expensive monad abstraction is deferred until we have evidence we need
@@ -386,6 +390,10 @@ interleaving is determined by the rig's choice sequence. This holds as long as
 rig-controlled events are the only source of progress, which means real time
 must be banned in the system under test (see the caveat in section 2.7).
 
+It also fails outright where progress can come from somewhere the rig does not
+control, which is the case for any server using `client-server`'s external STM
+inputs or its timers. See sections 10.2 and 10.3.
+
 This does not give full interleaving coverage. It will not find a race between
 two user process threads that are both already runnable. It does make the
 entire protocol layer deterministic, which is where this library's bugs
@@ -486,7 +494,246 @@ Recommendation:
 5. Layer 4: the `quickcheck-dynamic` model. Where the real bug-finding starts.
 6. Only then decide about 7.2 or 7.3.
 
-## 10. References
+## 10. The `client-server` family needs separate treatment
+
+Sections 4 to 9 address `distributed-process` and the protocol surface. They do
+not cover `distributed-process-client-server`, and by extension they do not
+cover `supervisor`, `execution`, or `fsm`, all of which depend on it. This
+section corrects that.
+
+The distinction that matters:
+
+- `distributed-process` bugs are protocol bugs. State is spread across nodes and
+  the nondeterminism is message order. Transport and control-channel ordering
+  are the right levers, and quiescence stepping is sound because every source
+  of progress is a message.
+- `client-server` bugs are single-process concurrency bugs: mask windows,
+  `orElse` ordering, timer-versus-message races, drain batching, and `IORef`
+  state mutated under async exceptions. State is in one process and the
+  nondeterminism is the thread schedule and the clock. Transport control is
+  irrelevant.
+
+### 10.1 What the layered rig does cover
+
+One piece of good news first, because it is load-bearing for `supervisor` and
+`fsm`. The default is
+`defaultRecvTimeoutPolicy = RecvMaxBacklog 10000`
+(`ManagedProcess.hs:750`), not a timer. With that policy `maybeStartTimer`
+returns `delayTimer Infinity`, so `matchTimeout tt` is `[]` and no system timer
+takes part in draining.
+
+`drainMailbox` then loops on `receiveTimeout 0 ms` and stops when the mailbox
+is empty. So the drain batch boundary is "nothing more is currently available",
+which is a function of arrival order alone. Under Layers 1 and 2 with
+quiescence stepping, releasing one message produces a one-message batch, and
+releasing N before stepping produces an N-message batch. Priority ordering
+within a batch becomes deterministic and testable.
+
+That is worth stating plainly, because batch composition is exactly what
+decides whether `supervisor` sees `IgnoreChildReq` (priority 100) ahead of a
+`ProcessMonitorNotification` (99) ahead of a `DelayedRestart` (80)
+(`Supervisor.hs:713-719`).
+
+### 10.2 External STM inputs bypass every interception point
+
+`handleExternal`, `handleExternalCall`, `handleCallExternal`, and `callSTM`
+build a `DispatchSTM` carrying a user-supplied `STM a` reader and a
+`(w -> STM ())` writer (`Internal/Types.hs:507-510`,
+`Server.hs:425-470`). The data path is a client thread doing
+`atomically $ writeTQueue inChan x` and the server picking it up through
+`matchSTM` in its `receiveWait`.
+
+That path touches none of: the transport, `localCtrlChan`, or the process
+`CQueue`'s `incoming` channel. Layers 1 and 2 are blind to it.
+
+Worse, it breaks the soundness condition in section 7.1. The documented purpose
+of this API is communication with code outside the `Process` monad, including
+plain OS threads, so an external writer is a source of progress that the rig
+does not control. Quiescence stepping is not merely incomplete here, it can
+observe a "quiescent" system that is about to be woken by a thread the rig
+never knew about.
+
+`execution` uses the same style directly: `Exchange/Broadcast.hs` writes with
+`atomically $ writeTChan channel msg` and hands subscribers a `dupTChan`
+(lines 234, 273), and `writeToStream (WriteSTM stm)` applies an arbitrary user
+transaction (line 313). `Mailbox.hs` uses `dupTChan` for its control plane
+(lines 468-495, 565).
+
+Proposed fix: make the external input surface nameable so the rig can gate it.
+
+```haskell
+data ExternalInput a = ExternalInput
+  { eiRead  :: STM a
+  , eiLabel :: String      -- for traces, and so the rig can address it
+  }
+```
+
+`handleExternal` and friends take an `ExternalInput a` instead of a bare
+`STM a`, with the existing signature retained as a wrapper for compatibility. A
+test-only constructor then wraps any user read in a gate, so `eiRead` becomes
+`gate >> userRead` where the gate `retry`s until the rig opens it. External
+inputs rejoin the set of rig-steppable events, and section 7.1 becomes sound
+again for servers that use them.
+
+This also makes testable something that currently is not. See 10.4.
+
+### 10.3 Real time is load-bearing, and there is no hook
+
+`Timer.hs` selects between two implementations at runtime based on
+`rtsSupportsBoundThreads` (lines 113-128):
+
+- Under `-threaded`, `registerDelay` returns a `TVar Bool` flipped by the RTS IO
+  manager. There is no interception point, nothing to advance, and
+  `listThreads` cannot report it as pending.
+- Otherwise, `runAfter` is used, which is
+  `spawnLocal $ runTimer t p True` in `extras`, so the timer is a whole extra
+  process reading its own mailbox. The module's own notes concede that this
+  process "could theoretically die before setting the variable".
+
+Two implementations with different failure modes, selected by a build flag, and
+neither tested against the other.
+
+`CQueue.dequeue` adds a third source: the `Timeout n` block spec uses
+`System.Timeout.timeout`, which is an async exception thrown from a separate
+timer thread.
+
+The downstream consequences are concrete. `Supervisor.doRestartDelay`
+(`Supervisor.hs:1196-1198`) is `evalAfter rDelay (DelayedRestart ...)`, which
+routes through `addUserTimer` to `startTimer` to `registerDelay`. And
+`childShutdown` with `StopTimeout delay` uses
+`receiveTimeout (asTimeout t)` (`Supervisor.hs:1436-1438`). So both of the
+supervisor's timing-sensitive behaviours, delayed restart and graceful stop,
+sit on real time and are unreachable from the transport or the node controller.
+
+Proposed fix: make the clock injectable.
+
+```haskell
+data TimerBackend = TimerBackend
+  { tbRegisterDelay :: Int -> IO (TVar Bool)
+  , tbRunAfter      :: TimeInterval -> Process () -> Process TimerRef
+  , tbCancel        :: TimerRef -> Process ()
+  }
+
+realTimerBackend    :: TimerBackend              -- exactly today's behaviour
+virtualTimerBackend :: Clock -> TimerBackend
+```
+
+`Clock` is rig-owned, with `advance :: TimeInterval -> IO ()` flipping every
+`TVar Bool` whose deadline has passed, in deadline order with ties broken by
+registration order. Thread the backend through `PrioritisedProcessDefinition`,
+defaulting to `realTimerBackend`, so nothing changes for existing users.
+
+The `Timeout n` path in `CQueue.dequeue` needs a matching hook in
+`distributed-process`. It is one function, and the change is to consult the
+rig's clock rather than call `System.Timeout.timeout`.
+
+Once this is in place, `RecvTimer d` becomes as deterministic as
+`RecvMaxBacklog cnt`, and `RestartDelay` and `StopTimeout` become testable
+without sleeping.
+
+### 10.4 `orElse` ordering is semantically significant and currently untestable
+
+`CQueue.chunkMatches` splits a match list into alternating chunks of message
+matches and STM matches, and `mkSTM` folds `orElse` in chunk order with
+`readTChan incoming` standing in for each message chunk. `orElse` is
+left-biased, so match list order decides who wins when both a mailbox message
+and an external input are ready.
+
+The orders in use are not consistent:
+
+- `processApply` builds `(shutdown':extMatchers) ++ apiMatchers ++ infoMatchers`
+  (`GenProcess.hs`), so external handlers outrank API handlers.
+- `drainMailbox` builds `ts ++ (matchAny (return . Right) : mkMatchers ps pd)`,
+  so user timers come first, then `matchAny` over the mailbox, then the extern
+  matchers. During a drain, the mailbox outranks external input, which is the
+  reverse of `processApply`.
+
+Whether that asymmetry is intentional is not recorded anywhere, and no test can
+currently distinguish the two orderings, because nothing can arrange for a
+mailbox message and an external STM input to be ready at the same instant.
+
+Separately, `goCheck` runs a non-blocking `waitChans` pass per chunk against
+already-arrived messages before it ever blocks, so "already in the mailbox" and
+"arrives while blocked" take different code paths with different ordering.
+
+With 10.2's gates on external inputs and Layer 1's control of mailbox arrival,
+all three cases become constructible: mailbox only ready, extern only ready,
+both ready. That is the minimum needed to pin down the intended semantics and
+then defend it.
+
+### 10.5 The `callSTM` monitor race can be made deterministic
+
+`Client.hs:208-228` documents a race it describes as unfixable: `monitor` is
+asynchronous, so there is no guarantee the node controller establishes the
+monitor before the server observes the STM write, and a server that dies at
+that moment can yield `ExitOther "DiedUnknownId"` instead of the real reason.
+
+The race cannot be eliminated, but Layer 2 makes it deterministically
+testable. With the rig controlling `ctrlChan` admission, both orderings can be
+forced and the client's behaviour asserted in each. That converts an
+acknowledged hazard into a pair of regression tests, which is worth doing on
+its own.
+
+### 10.6 Async exception windows need a scheduler, or a narrower target
+
+Three long notes in `GenProcess.hs` state the real correctness argument for the
+module: "handling async exceptions during non-blocking reads", "masking async
+exceptions during recv", and "timer handling whilst draining the process'
+mailbox". All three assert an invariant of the form "if we have dequeued a
+message we must not lose it when an async exception arrives", defended by a
+specific placement of `mask_` and `mask $ \restore` around the dequeue and
+enqueue steps.
+
+Testing that requires delivering an async exception at a chosen point in
+another thread's execution. Neither the transport nor the node controller can
+do it. `dejafu` and `IOSimPOR` both can, because they own the thread.
+
+Porting `GenProcess` to `MonadConc` in isolation is not possible, because
+`GenProcess s` is `StateT (State s) Process` and so inherits the fixed `IO`
+base. The practical route is to shrink the target instead:
+
+1. `Internal/PriorityQueue.hs` is 41 lines and entirely pure, a wrapper over
+   `Data.PriorityQueue.FingerTree`. It can be property-tested today with plain
+   QuickCheck and no concurrency at all. Nothing stops this.
+2. Refactor `recvQueue` so that `scanMailbox` is the only thing that touches
+   the mailbox, and `drainAux`, `enqueueMessage`, `processNext`, and
+   `filterNext` become a pure function from
+   (current priority queue, batch of arrived messages, priority specs, filters)
+   to (actions, new queue). The priority and filter semantics then get
+   exhaustive property testing with no concurrency, and the concurrency surface
+   shrinks to one question: does `scanMailbox` lose messages under async
+   exceptions.
+
+   This refactor is worth doing regardless of testing strategy. At present
+   "what the priority semantics are" and "when the mailbox is read" are
+   tangled inside one 300-line `where` block, which is why neither can be
+   tested separately.
+3. For the residual mask-window question, a targeted injector is more practical
+   than a general scheduler: a test helper that `throwTo`s the server at a
+   point identified by a rig-controlled gate placed in the test's own handler.
+   Crude, but it tests the stated invariant directly and needs no monad
+   abstraction.
+
+### 10.7 Consequences for the plan
+
+- Section 7.1's claim holds only where rig-controlled events are the sole
+  source of progress. That is true for `distributed-process`. It is false for
+  any server using external STM inputs or timers until 10.2 and 10.3 are done.
+- 10.3 is a prerequisite for deterministic testing of `supervisor`, `execution`,
+  and `fsm`, not an optional extra. Those three sit on `client-server`, so no
+  amount of transport rigging makes them deterministic while the clock is the
+  RTS IO manager.
+- The ordering within section 9 should therefore be: Layer 0, then 10.3 (the
+  timer backend), then Layer 1, then 10.2 (external input gates), then Layer 2,
+  then Layer 3.1, then 10.6's refactor, then Layer 4. The timer backend moves
+  early because it is small, self-contained, and everything downstream of
+  `client-server` is blocked on it.
+- The case for eventually abstracting the base monad (7.3) is stronger than
+  section 7 implied. The layered rig buys protocol determinism. It does not buy
+  single-process concurrency correctness, and for the mask and `orElse`
+  properties there is no cheap substitute for owning the thread.
+
+## 11. References
 
 - [GHC proposal #313, delimited continuation primops](https://ghc-proposals.readthedocs.io/en/latest/proposals/0313-delimited-continuation-primops.html)
 - [Composable Scheduler Activations for Haskell](https://simonmar.github.io/bib/papers/composable_scheduler_activations.pdf)
